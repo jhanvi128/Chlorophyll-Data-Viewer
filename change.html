@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chlorophyll Data Viewer</title>
+  <link rel="stylesheet" href="/static/ol/ol.css">
+  <script src="/static/js/chart.min.js"></script>
+  <style>
+    body, html {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      overflow: hidden;
+    }
+    #map {
+      width: 100%;
+      height: 100vh;
+    }
+    #sidebar {
+      position: fixed;
+      top: 0;
+      left: -200px; /* Reduce sidebar width */
+      width: 200px; /* Adjusted width */
+      height: 100%;
+      background-color: #f8f9fa;
+      transition: 0.3s;
+      padding: 20px;
+      box-shadow: 2px 0 5px rgba(0,0,0,0.2);
+      z-index: 1000;
+      display: none; /* Hide sidebar initially */
+    }
+    #sidebar.active {
+      left: 0;
+      display: block; /* Show sidebar when active */
+    }
+    #menu-toggle {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      z-index: 1001;
+      background: #007bff;
+      color: white;
+      border: none;
+      padding: 10px;
+      cursor: pointer;
+    }
+    #sidebar-content {
+      position: absolute;
+      top: 10%; /* Position elements somewhat above the center */
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    #sidebar-content select {
+      font-size: 1.2em; /* Increase dropdown font size */
+      padding: 5px; /* Increase dropdown padding */
+    }
+    #sidebar-content label {
+      font-size: 1.2em; /* Increase label font size */
+      margin-bottom: 2px; /* Minimize space between labels and inputs */
+    }
+    #sidebar-content input[type="date"] {
+      font-size: 1.2em; /* Increase date input font size */
+      padding: 5px; /* Increase input padding */
+    }
+    #submit {
+      font-size: 1.2em; /* Increase button font size */
+      background-color: #007bff;
+      color: white;
+      border: none;
+      padding: 10px;
+      cursor: pointer;
+    }
+    #submit:hover {
+      background-color: #0056b3;
+    }
+    #info-container {
+      position: absolute;
+      bottom: 0;
+      width: 100%;
+      background: rgba(255, 255, 255, 0.9);
+      max-height: 30vh;
+      overflow-y: auto;
+      z-index: 999;
+    }
+    #info {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    #info th, #info td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: left;
+    }
+    #chart-popup {
+      display: none;
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background-color: white;
+      padding: 20px;
+      border: 2px solid black;
+      z-index: 1001;
+      width: 700px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.5);
+    }
+    #chart-popup-close {
+      margin-top: 10px;
+      background-color: #dc3545;
+      color: white;
+      border: none;
+      padding: 5px 10px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <button id="menu-toggle">☰</button>
+  <div id="sidebar">
+    <div id="sidebar-content">
+      <!-- Dropdown positioned above the center -->
+      <select id="analysis-type">
+        <option value="point">Point wise Analysis</option>
+        <option value="region">Region wise Analysis</option>
+      </select>
+
+      <!-- Start date input -->
+      <label for="start-date">Starting Date:</label>
+      <input type="date" id="start-date" required>
+
+      <!-- End date input -->
+      <label for="end-date">Ending Date:</label>
+      <input type="date" id="end-date" required>
+
+      <!-- Submit button -->
+      <button id="submit">Submit</button>
+    </div>
+  </div>
+  <div id="map"></div>
+  <div id="info-container" style="display: none;">
+    <table id="info">
+      <thead>
+        <tr><th>Date</th><th>Chlorophyll Value</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <div id="chart-popup">
+    <canvas id="chlorophyll-chart"></canvas>
+    <button id="chart-popup-close">Close</button>
+  </div>
+
+  <script src="/static/ol/ol.js"></script>
+  <script>
+    const proxyUrl = "http://localhost:8080/geoserver";
+    const layerName = "netcdf_project:E06OCML4AC_2023-12-01";
+    let selectedPoint = null;
+    let selectedRegion = null;
+    let drawInteraction = null;
+    let chlorophyllChart;
+
+    const map = new ol.Map({
+      target: 'map',
+      layers: [
+        new ol.layer.Tile({
+          source: new ol.source.OSM()
+        }),
+        new ol.layer.Image({
+          source: new ol.source.ImageWMS({
+            url: proxyUrl + "/wms",
+            params: { 'LAYERS': layerName, 'FORMAT': 'image/png' },
+            serverType: 'geoserver',
+            crossOrigin: 'anonymous',
+          }),
+        }),
+      ],
+      view: new ol.View({
+        center: ol.proj.fromLonLat([0, 0]),
+        zoom: 2,
+      })
+    });
+
+    const source = new ol.source.Vector();
+    const vectorLayer = new ol.layer.Vector({ source: source });
+    map.addLayer(vectorLayer);
+
+    function toggleSidebar() {
+      const sidebar = document.getElementById('sidebar');
+      sidebar.classList.toggle('active');
+    }
+
+    document.getElementById('menu-toggle').addEventListener('click', toggleSidebar);
+
+    function setInteraction() {
+      if (drawInteraction) {
+        map.removeInteraction(drawInteraction);
+      }
+
+      const analysisType = document.getElementById('analysis-type').value;
+      source.clear();
+      selectedPoint = null;
+      selectedRegion = null;
+
+      if (analysisType === 'point') {
+        map.on('singleclick', handlePointClick);
+      } else if (analysisType === 'region') {
+        drawInteraction = new ol.interaction.Draw({
+          source: source,
+          type: 'Circle',
+          geometryFunction: ol.interaction.Draw.createBox()
+        });
+        drawInteraction.on('drawstart', () => source.clear());
+        drawInteraction.on('drawend', (event) => {
+          const extent = event.feature.getGeometry().getExtent();
+          const [minX, minY, maxX, maxY] = ol.proj.transformExtent(extent, 'EPSG:3857', 'EPSG:4326');
+          selectedRegion = [minX, minY, maxX, maxY];
+          console.log('Selected Region:', selectedRegion);
+        });
+        map.addInteraction(drawInteraction);
+        map.un('singleclick', handlePointClick);
+      }
+    }
+
+    function handlePointClick(evt) {
+      const coord = ol.proj.toLonLat(evt.coordinate);
+      selectedPoint = [coord[0], coord[1]];
+      console.log('Selected Point:', selectedPoint);
+      source.clear();
+      const feature = new ol.Feature({
+        geometry: new ol.geom.Point(evt.coordinate)
+      });
+      source.addFeature(feature);
+    }
+
+    document.getElementById('analysis-type').addEventListener('change', setInteraction);
+    setInteraction(); // Initialize with default (point)
+
+    document.getElementById('submit').addEventListener('click', async () => {
+      const startDate = document.getElementById('start-date').value;
+      const endDate = document.getElementById('end-date').value;
+      const analysisType = document.getElementById('analysis-type').value;
+
+      if (!startDate || !endDate) {
+        alert('Please select start and end dates.');
+        return;
+      }
+
+      if (analysisType === 'point' && !selectedPoint) {
+        alert('Please click on the map to select a point.');
+        return;
+      } else if (analysisType === 'region' && !selectedRegion) {
+        alert('Please draw a rectangular region on the map.');
+        return;
+      }
+
+      const requestData = {
+        start_date: startDate,
+        end_date: endDate,
+        analysis_type: analysisType
+      };
+      if (analysisType === 'point') {
+        requestData.point = selectedPoint;
+      } else {
+        requestData.region = selectedRegion;
+      }
+
+      const response = await fetch('/get_chlorophyll_data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestData)
+      });
+
+      const data = await response.json();
+      const tableBody = document.querySelector('#info tbody');
+      tableBody.innerHTML = '';
+      const chartData = [];
+
+      data.forEach(row => {
+        tableBody.innerHTML += `<tr><td>${row.date}</td><td>${row.value}</td></tr>`;
+        if (row.value !== 'No data' && row.value !== 'Error') {
+          chartData.push({ date: row.date, value: row.value });
+        }
+      });
+
+      document.getElementById('info-container').style.display = 'block';
+      if (chartData.length > 0) {
+        showChart(chartData);
+      }
+    });
+
+    function showChart(chartData) {
+      const ctx = document.getElementById('chlorophyll-chart').getContext('2d');
+      if (chlorophyllChart) chlorophyllChart.destroy();
+
+      chlorophyllChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: chartData.map(item => item.date),
+          datasets: [{
+            label: 'Chlorophyll Value',
+            data: chartData.map(item => item.value),
+            borderColor: 'blue',
+            fill: false
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            title: {
+              display: true,
+              text: 'Chlorophyll Value Analysis',  // New title
+              font: {
+                size: 20,  // Increase title size
+                weight: 'bold'  // Make title bold
+              },
+              padding: {
+                top: 10,
+                bottom: 20
+              }
+            }
+          },
+          scales: {
+          x: {
+            ticks: {
+              font: {
+                size: 14, // Set X-axis tick font size
+                weight: 'bold' // Make X-axis tick labels bold
+              }
+            },
+            title: {
+              display: true,
+              text: 'Date',
+              font: {
+                size: 16, // Set X-axis title font size
+                weight: 'bold' // Make X-axis title bold
+              }
+            }
+          },
+          y: {
+            ticks: {
+              font: {
+                size: 14, // Set Y-axis tick font size
+                weight: 'bold' // Make Y-axis tick labels bold
+              }
+            },
+            title: {
+              display: true,
+              text: 'Chlorophyll Value',
+              font: {
+                size: 16, // Set Y-axis title font size
+                weight: 'bold' // Make Y-axis title bold
+              }
+            }
+          }
+        }
+      }
+    });
+
+      document.getElementById('chart-popup').style.display = 'block';
+    }
+
+    document.getElementById('chart-popup-close').addEventListener('click', () => {
+      document.getElementById('chart-popup').style.display = 'none';
+    });
+  </script>
+</body>
+</html>
